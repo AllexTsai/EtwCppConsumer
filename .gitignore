@@ -1,6 +1,18 @@
-﻿bin/
-obj/
+build/
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+CMakeFiles/
+CMakeCache.txt
+
+# 執行與驗證產生的輸出
+run*.txt
+summary_*.txt
+started_pids*.txt
+*.log
+
+# 編輯器
+.vs/
 .vscode/
-*.user
-*.suo
-*.env
