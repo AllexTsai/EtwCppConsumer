@@ -18,11 +18,13 @@ struct EventSlot {
     EVENT_HEADER header;               // 含 Flags（32/64 位元指標大小等），TDH 需要
     ETW_BUFFER_CONTEXT bufferContext;
     USHORT userDataLength;
+    int64_t eventTick;                 // EVENT_HEADER.TimeStamp 的原始值（RAW_TIMESTAMP + QPC 時為 QPC tick）
+    int64_t callbackEntryTick;         // callback 一進入時的 QueryPerformanceCounter；0 = 無法取得
     alignas(16) BYTE userData[kMaxUserDataBytes];
 };
 
 // 前提：record.UserDataLength <= kMaxUserDataBytes（由呼叫端檢查）。不配置記憶體。
-void CopyToSlot(const EVENT_RECORD& record, uint64_t sequence, EventSlot& slot) noexcept;
+void CopyToSlot(const EVENT_RECORD& record, uint64_t sequence, int64_t callbackEntryTick, EventSlot& slot) noexcept;
 
 // 用槽位內的副本重建 EVENT_RECORD。UserData 指向 slot.userData，
 // 只在槽位尚未歸還給佇列之前有效。ExtendedData 不複製（Count = 0）。

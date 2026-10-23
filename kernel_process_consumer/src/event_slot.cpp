@@ -2,12 +2,14 @@
 
 #include <cstring>
 
-void CopyToSlot(const EVENT_RECORD& record, uint64_t sequence, EventSlot& slot) noexcept
+void CopyToSlot(const EVENT_RECORD& record, uint64_t sequence, int64_t callbackEntryTick, EventSlot& slot) noexcept
 {
     slot.sequence = sequence;
     slot.header = record.EventHeader;
     slot.bufferContext = record.BufferContext;
     slot.userDataLength = record.UserDataLength;
+    slot.eventTick = record.EventHeader.TimeStamp.QuadPart;
+    slot.callbackEntryTick = callbackEntryTick;
     if (record.UserDataLength > 0)
         std::memcpy(slot.userData, record.UserData, record.UserDataLength);
 }

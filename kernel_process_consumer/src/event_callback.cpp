@@ -1,6 +1,6 @@
 #include "event_callback.h"
 
-void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record) noexcept
+void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record, int64_t callbackEntryTick) noexcept
 {
     EventCounters& c = ctx.counters;
 
@@ -19,7 +19,7 @@ void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record) noexcep
     }
 
     const bool pushed = ctx.ring.TryPush(
-        [&](EventSlot& slot) noexcept { CopyToSlot(record, sequence, slot); });
+        [&](EventSlot& slot) noexcept { CopyToSlot(record, sequence, callbackEntryTick, slot); });
     if (pushed)
         c.enqueued.fetch_add(1, std::memory_order_relaxed);
     else
@@ -28,15 +28,20 @@ void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record) noexcep
 
 void WINAPI OnEventRecord(PEVENT_RECORD record)
 {
-    auto* ctx = static_cast<ConsumerContext*>(record->UserContext);
-
+    // 一進入就取 QPC：同時作為槽位的 callbackEntryTick 與 callback 耗時的起點
     LARGE_INTEGER start;
     const BOOL startOk = QueryPerformanceCounter(&start);
 
-    HandleEventRecord(*ctx, *record);
+    auto* ctx = static_cast<ConsumerContext*>(record->UserContext);
+    if (!startOk)
+        ctx->counters.qpcFailures.fetch_add(1, std::memory_order_relaxed);
 
+    HandleEventRecord(*ctx, *record, startOk ? start.QuadPart : 0);
+
+    if (!startOk)
+        return;
     LARGE_INTEGER end;
-    if (startOk && QueryPerformanceCounter(&end)) {
+    if (QueryPerformanceCounter(&end)) {
         const int64_t elapsed = end.QuadPart - start.QuadPart;
         // 只有 callback 執行緒會寫入，所以 load + store 不會有競爭
         if (elapsed > ctx->counters.maxCallbackTicks.load(std::memory_order_relaxed))

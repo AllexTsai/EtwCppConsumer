@@ -48,8 +48,9 @@ struct ConsumerContext {
 
 // callback 本體（不計時）：只檢查 provider、複製進槽位、更新原子計數器。
 // 不呼叫 printf / TDH，不配置記憶體，不阻塞。
-void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record) noexcept;
+// callbackEntryTick：callback 進入時的 QPC 值，存進槽位；0 表示無法取得（測試可省略）。
+void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record, int64_t callbackEntryTick = 0) noexcept;
 
 // ETW 的 EventRecordCallback。record->UserContext 必須是 ConsumerContext*。
-// 在 HandleEventRecord 前後用 QueryPerformanceCounter 計時，記錄最大值。
+// 一進入就呼叫 QueryPerformanceCounter（存進槽位，並用來計算 callback 耗時的最大值）。
 void WINAPI OnEventRecord(PEVENT_RECORD record);

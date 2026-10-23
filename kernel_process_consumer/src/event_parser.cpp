@@ -273,7 +273,7 @@ void ParseEvent(const EVENT_RECORD& record, ParsedEvent& ev, std::atomic<uint64_
     ev.version = h.EventDescriptor.Version;
     ev.opcode = h.EventDescriptor.Opcode;
     ev.task = h.EventDescriptor.Task;
-    ev.timestamp = static_cast<ULONGLONG>(h.TimeStamp.QuadPart); // 未設 RAW_TIMESTAMP，所以是 FILETIME
+    ev.timestamp = static_cast<ULONGLONG>(h.TimeStamp.QuadPart); // 依前提為 FILETIME（見 event_parser.h）
     ev.headerProcessId = h.ProcessId;
     ev.headerThreadId = h.ThreadId;
 
@@ -297,12 +297,17 @@ void ParseEvent(const EVENT_RECORD& record, ParsedEvent& ev, std::atomic<uint64_
     }
 }
 
-std::wstring FormatEventText(const ParsedEvent& ev)
+std::wstring FormatEventText(const ParsedEvent& ev, const std::wstring& timestampSuffix)
 {
     std::wstring text;
     text += Format(L"EventId=%u  Version=%u  Task=%u(%ls)  Opcode=%u(%ls)\n", ev.id, ev.version, ev.task,
                    ev.taskName.c_str(), ev.opcode, ev.opcodeName.c_str());
-    text += L"TimeStamp=" + FormatFileTimeLocal(ev.timestamp) + Format(L" (raw FILETIME %llu)\n", ev.timestamp);
+    // 0 是無法換算的標記（FILETIME 0 = 1601 年，不可能是真實事件時間），不要把它當日期印出
+    if (ev.timestamp == 0)
+        text += L"TimeStamp=<unavailable>" + timestampSuffix + L"\n";
+    else
+        text += L"TimeStamp=" + FormatFileTimeLocal(ev.timestamp) + Format(L" (raw FILETIME %llu)", ev.timestamp) +
+                timestampSuffix + L"\n";
     text += Format(L"Header.ProcessId=%lu  Header.ThreadId=%lu\n", ev.headerProcessId, ev.headerThreadId);
 
     if (ev.tdhInfoStatus != ERROR_SUCCESS) {
