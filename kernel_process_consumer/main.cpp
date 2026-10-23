@@ -46,10 +46,16 @@ enum : int {
 // 解析命令列。支援：
 //   --capacity N          N 為 2 的冪次，1..kMaxQueueCapacity
 //   --summary-file PATH   結束時另外把總結以 UTF-8 寫進這個檔案
+//   --quiet               不印每筆事件的明細（解析、換算與統計照常）
 // 格式錯誤時印出原因並回傳 false；不認得的參數只警告並忽略。
-bool ParseArguments(int argc, char** argv, size_t& capacity, bool& fromCommandLine, const char*& summaryFile)
+bool ParseArguments(int argc, char** argv, size_t& capacity, bool& fromCommandLine, const char*& summaryFile,
+                    bool& quiet)
 {
     for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quiet") == 0) {
+            quiet = true;
+            continue;
+        }
         if (std::strcmp(argv[i], "--summary-file") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '\0') {
                 std::printf("ERROR: --summary-file requires a non-empty path\n");
@@ -233,11 +239,12 @@ struct ConsumerThreadArgs {
     ConsumerContext* ctx = nullptr;
     const QpcClock* clock = nullptr;
     LatencyStats* latency = nullptr;
+    bool quiet = false;               // --quiet：不輸出每筆事件明細
     HANDLE doneEvent = nullptr;       // 設定後代表「不會再有新事件」
     DWORD waitError = ERROR_SUCCESS;
 };
 
-void DrainQueue(ConsumerContext& ctx, const QpcClock& clock, LatencyStats& latency)
+void DrainQueue(ConsumerContext& ctx, const QpcClock& clock, LatencyStats& latency, bool quiet)
 {
     ParsedEvent ev;
     uint64_t sequence = 0;
@@ -283,6 +290,9 @@ void DrainQueue(ConsumerContext& ctx, const QpcClock& clock, LatencyStats& laten
             RecordDelay(latency.etwDelay, eventTick, callbackEntryTick, clock.valid ? clock.freq : 0) +
             L"  queue_wait_us=" + RecordDelay(latency.queueWait, callbackEntryTick, dequeueTick, clock.qpcFrequency) +
             L"  process_us=" + RecordDelay(latency.process, dequeueTick, consumerDoneTick, clock.qpcFrequency);
+        // --quiet：上面的解析、換算與延遲統計都已完成，只略過組字串與輸出
+        if (quiet)
+            continue;
         std::wstring text = L"---------------- seq=" + std::to_wstring(sequence) + L" ----------------\n" +
                             FormatEventText(ev, delays);
         std::printf("%ls", text.c_str());
@@ -296,16 +306,16 @@ DWORD WINAPI ConsumerThread(LPVOID param)
     std::printf("[consumer %lu] started\n", GetCurrentThreadId());
     std::fflush(stdout);
     for (;;) {
-        DrainQueue(*args->ctx, *args->clock, *args->latency);
+        DrainQueue(*args->ctx, *args->clock, *args->latency, args->quiet);
         const DWORD w = WaitForSingleObject(args->doneEvent, kConsumerIdleWaitMs);
         if (w == WAIT_OBJECT_0) {
             // 生產者已確定停止：最後再清空一次
-            DrainQueue(*args->ctx, *args->clock, *args->latency);
+            DrainQueue(*args->ctx, *args->clock, *args->latency, args->quiet);
             return 0;
         }
         if (w == WAIT_FAILED) {
             args->waitError = GetLastError();
-            DrainQueue(*args->ctx, *args->clock, *args->latency);
+            DrainQueue(*args->ctx, *args->clock, *args->latency, args->quiet);
             return 1;
         }
         // WAIT_TIMEOUT：繼續輪詢
@@ -364,8 +374,10 @@ int main(int argc, char** argv)
     size_t queueCapacity = kQueueCapacity;
     bool capacityFromCommandLine = false;
     const char* summaryFile = nullptr;
-    if (!ParseArguments(argc, argv, queueCapacity, capacityFromCommandLine, summaryFile)) {
-        std::printf("Usage: kernel_process_consumer.exe [--capacity N] [--summary-file PATH]   (default N=%zu)\n",
+    bool quiet = false;
+    if (!ParseArguments(argc, argv, queueCapacity, capacityFromCommandLine, summaryFile, quiet)) {
+        std::printf("Usage: kernel_process_consumer.exe [--capacity N] [--summary-file PATH] [--quiet]"
+                    "   (default N=%zu)\n",
                     kQueueCapacity);
         return kExitInvalidArguments;
     }
@@ -472,6 +484,7 @@ int main(int argc, char** argv)
     consumerArgs.clock = &clock;
     LatencyStats latency; // 宣告在執行緒 handle 之前：比消費者執行緒活得久
     consumerArgs.latency = &latency;
+    consumerArgs.quiet = quiet;
     consumerArgs.doneEvent = doneEvent.Get();
     ScopedHandle consumerThread(CreateThread(nullptr, 0, ConsumerThread, &consumerArgs, 0, nullptr));
     if (!consumerThread.Valid()) {
@@ -682,6 +695,7 @@ int main(int argc, char** argv)
     AppendLatencyStat(latencyText, "queue_wait", latency.queueWait, clock.qpcFrequency, "  ");
     AppendLatencyStat(latencyText, "process", latency.process, clock.qpcFrequency, "  ");
     std::printf("Latency:\n%s", latencyText.c_str());
+    std::printf("quiet=%d\n", quiet ? 1 : 0);
 
     std::printf("Summary: exit code=%d\n", exitCode);
     std::fflush(stdout);
@@ -722,6 +736,7 @@ int main(int argc, char** argv)
         AppendLatencyStat(s, "etw_delay", latency.etwDelay, clock.valid ? clock.freq : 0, "\n");
         AppendLatencyStat(s, "queue_wait", latency.queueWait, clock.qpcFrequency, "\n");
         AppendLatencyStat(s, "process", latency.process, clock.qpcFrequency, "\n");
+        AppendFormat(s, "quiet=%d\n", quiet ? 1 : 0);
         AppendFormat(s, "exit_code=%d\n", exitCode);
         WriteSummaryFile(summaryFile, s);
         std::fflush(stdout);
