@@ -1,6 +1,7 @@
 #pragma once
 
 #include "event_slot.h"
+#include "latency_stat.h"
 #include "spsc_ring.h"
 
 #include <windows.h>
@@ -38,16 +39,21 @@ struct EventCounters {
     std::atomic<uint64_t> withExtendedData{0};  // 帶 ExtendedData 的事件（副本不保留）
     std::atomic<uint64_t> qpcFailures{0};       // QueryPerformanceCounter 失敗次數
     std::atomic<int64_t> maxCallbackTicks{0};   // callback 單次最長耗時（QPC ticks）
+    LatencyStat callbackDuration;               // callback 耗時統計（只有 callback 執行緒寫入）
+    std::atomic<uint64_t> dataReadySetEventFailures{0}; // notify 模式 SetEvent(dataReady) 失敗次數
 };
 
 struct ConsumerContext {
     explicit ConsumerContext(size_t queueCapacity) : ring(queueCapacity) {}
     SpscRing<EventSlot> ring;
     EventCounters counters;
+    // notify 模式：auto-reset 事件，callback 每次 TryPush 成功後 SetEvent；
+    // nullptr = poll 模式（不通知）。由呼叫端擁有（RAII），必須比 ProcessTrace 執行緒活得久。
+    HANDLE dataReadyEvent = nullptr;
 };
 
-// callback 本體（不計時）：只檢查 provider、複製進槽位、更新原子計數器。
-// 不呼叫 printf / TDH，不配置記憶體，不阻塞。
+// callback 本體（不計時）：只檢查 provider、複製進槽位、更新原子計數器；
+// notify 模式下入佇列成功後 SetEvent（不阻塞、不配置記憶體）。不呼叫 printf / TDH。
 // callbackEntryTick：callback 進入時的 QPC 值，存進槽位；0 表示無法取得（測試可省略）。
 void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record, int64_t callbackEntryTick = 0) noexcept;
 

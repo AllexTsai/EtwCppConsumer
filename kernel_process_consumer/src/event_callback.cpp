@@ -20,10 +20,14 @@ void HandleEventRecord(ConsumerContext& ctx, const EVENT_RECORD& record, int64_t
 
     const bool pushed = ctx.ring.TryPush(
         [&](EventSlot& slot) noexcept { CopyToSlot(record, sequence, callbackEntryTick, slot); });
-    if (pushed)
+    if (pushed) {
         c.enqueued.fetch_add(1, std::memory_order_relaxed);
-    else
+        // notify 模式：只在入佇列成功後通知；佇列滿而丟棄時不通知
+        if (ctx.dataReadyEvent != nullptr && !SetEvent(ctx.dataReadyEvent))
+            c.dataReadySetEventFailures.fetch_add(1, std::memory_order_relaxed);
+    } else {
         c.droppedQueueFull.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void WINAPI OnEventRecord(PEVENT_RECORD record)
@@ -38,15 +42,19 @@ void WINAPI OnEventRecord(PEVENT_RECORD record)
 
     HandleEventRecord(*ctx, *record, startOk ? start.QuadPart : 0);
 
-    if (!startOk)
+    if (!startOk) {
+        ctx->counters.callbackDuration.excluded.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
     LARGE_INTEGER end;
     if (QueryPerformanceCounter(&end)) {
         const int64_t elapsed = end.QuadPart - start.QuadPart;
         // 只有 callback 執行緒會寫入，所以 load + store 不會有競爭
         if (elapsed > ctx->counters.maxCallbackTicks.load(std::memory_order_relaxed))
             ctx->counters.maxCallbackTicks.store(elapsed, std::memory_order_relaxed);
+        ctx->counters.callbackDuration.Add(elapsed);
     } else {
         ctx->counters.qpcFailures.fetch_add(1, std::memory_order_relaxed);
+        ctx->counters.callbackDuration.excluded.fetch_add(1, std::memory_order_relaxed);
     }
 }

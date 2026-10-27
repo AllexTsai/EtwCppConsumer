@@ -27,6 +27,9 @@ constexpr size_t kQueueCapacity = kDefaultQueueCapacity;
 constexpr size_t kMaxQueueCapacity = 65536;
 constexpr DWORD kThreadJoinTimeoutMs = 5000;
 constexpr DWORD kConsumerIdleWaitMs = 1; // 佇列空時的等待；實際解析度受系統計時器影響
+// notify 模式的保險逾時：正常情況由 dataReady 喚醒；萬一 SetEvent 失敗或通知邏輯有缺陷，
+// 最多延遲約這麼久就會再檢查一次佇列，不會永久停住
+constexpr DWORD kNotifySafetyTimeoutMs = 50;
 
 // 程式自己定義的結束碼（啟動階段失敗時仍回傳 Win32 錯誤碼）
 enum : int {
@@ -47,13 +50,30 @@ enum : int {
 //   --capacity N          N 為 2 的冪次，1..kMaxQueueCapacity
 //   --summary-file PATH   結束時另外把總結以 UTF-8 寫進這個檔案
 //   --quiet               不印每筆事件的明細（解析、換算與統計照常）
+//   --wake poll|notify    消費者喚醒方式，預設 poll
 // 格式錯誤時印出原因並回傳 false；不認得的參數只警告並忽略。
 bool ParseArguments(int argc, char** argv, size_t& capacity, bool& fromCommandLine, const char*& summaryFile,
-                    bool& quiet)
+                    bool& quiet, bool& wakeNotify)
 {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quiet") == 0) {
             quiet = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--wake") == 0) {
+            if (i + 1 >= argc) {
+                std::printf("ERROR: --wake requires a value (poll or notify)\n");
+                return false;
+            }
+            const char* mode = argv[++i];
+            if (std::strcmp(mode, "poll") == 0) {
+                wakeNotify = false;
+            } else if (std::strcmp(mode, "notify") == 0) {
+                wakeNotify = true;
+            } else {
+                std::printf("ERROR: --wake must be 'poll' or 'notify', got '%s'\n", mode);
+                return false;
+            }
             continue;
         }
         if (std::strcmp(argv[i], "--summary-file") == 0) {
@@ -178,24 +198,7 @@ double TicksToUs(int64_t ticks, LONGLONG freq)
     return static_cast<double>(ticks) * 1e6 / static_cast<double>(freq);
 }
 
-// 單一延遲指標的累計值（不保存個別樣本）。只有消費者執行緒寫入；
-// 用 atomic（relaxed）是因為逾時路徑上主執行緒可能在消費者仍執行時讀取。
-struct LatencyStat {
-    std::atomic<uint64_t> count{0};
-    std::atomic<int64_t> sumTicks{0};
-    std::atomic<int64_t> maxTicks{0};
-    std::atomic<uint64_t> excluded{0}; // 缺少 tick（QPC 失敗）或時鐘無效，不計入
-
-    void Add(int64_t ticks)
-    {
-        const uint64_t n = count.load(std::memory_order_relaxed);
-        if (n == 0 || ticks > maxTicks.load(std::memory_order_relaxed))
-            maxTicks.store(ticks, std::memory_order_relaxed);
-        sumTicks.fetch_add(ticks, std::memory_order_relaxed);
-        count.store(n + 1, std::memory_order_relaxed);
-    }
-};
-
+// LatencyStat 定義在 src/latency_stat.h（callback 耗時也使用）
 struct LatencyStats {
     LatencyStat etwDelay;   // callbackEntryTick - eventTick
     LatencyStat queueWait;  // dequeueTick - callbackEntryTick
@@ -241,6 +244,7 @@ struct ConsumerThreadArgs {
     LatencyStats* latency = nullptr;
     bool quiet = false;               // --quiet：不輸出每筆事件明細
     HANDLE doneEvent = nullptr;       // 設定後代表「不會再有新事件」
+    HANDLE dataReady = nullptr;       // notify 模式的 auto-reset 事件；nullptr = poll 模式
     DWORD waitError = ERROR_SUCCESS;
 };
 
@@ -305,6 +309,31 @@ DWORD WINAPI ConsumerThread(LPVOID param)
     auto* args = static_cast<ConsumerThreadArgs*>(param);
     std::printf("[consumer %lu] started\n", GetCurrentThreadId());
     std::fflush(stdout);
+
+    if (args->dataReady != nullptr) {
+        // notify 模式：取完佇列再等。dataReady 是 auto-reset；callback 在每次入佇列成功「之後」SetEvent，
+        // 所以在最後一次「佇列為空」的檢查之後才放入的事件，必定伴隨一次之後的 SetEvent：
+        // 若發生在 Wait 之前，事件維持 signaled，Wait 立即返回；若發生在 Wait 期間，Wait 被喚醒。
+        // 多次 SetEvent 會合併成一次 signaled，可能出現醒來時佇列已空的情況，無害。
+        // doneEvent 放在索引 0：兩者同時 signaled 時優先處理關閉。
+        HANDLE waits[2] = {args->doneEvent, args->dataReady};
+        for (;;) {
+            DrainQueue(*args->ctx, *args->clock, *args->latency, args->quiet);
+            const DWORD w = WaitForMultipleObjects(2, waits, FALSE, kNotifySafetyTimeoutMs);
+            if (w == WAIT_OBJECT_0) {
+                // 生產者已確定停止：最後再清空一次
+                DrainQueue(*args->ctx, *args->clock, *args->latency, args->quiet);
+                return 0;
+            }
+            if (w == WAIT_FAILED) {
+                args->waitError = GetLastError();
+                DrainQueue(*args->ctx, *args->clock, *args->latency, args->quiet);
+                return 1;
+            }
+            // WAIT_OBJECT_0 + 1（有新事件）或 WAIT_TIMEOUT（保險逾時）：回到迴圈開頭清空佇列
+        }
+    }
+
     for (;;) {
         DrainQueue(*args->ctx, *args->clock, *args->latency, args->quiet);
         const DWORD w = WaitForSingleObject(args->doneEvent, kConsumerIdleWaitMs);
@@ -375,9 +404,10 @@ int main(int argc, char** argv)
     bool capacityFromCommandLine = false;
     const char* summaryFile = nullptr;
     bool quiet = false;
-    if (!ParseArguments(argc, argv, queueCapacity, capacityFromCommandLine, summaryFile, quiet)) {
+    bool wakeNotify = false;
+    if (!ParseArguments(argc, argv, queueCapacity, capacityFromCommandLine, summaryFile, quiet, wakeNotify)) {
         std::printf("Usage: kernel_process_consumer.exe [--capacity N] [--summary-file PATH] [--quiet]"
-                    "   (default N=%zu)\n",
+                    " [--wake poll|notify]   (default N=%zu, wake=poll)\n",
                     kQueueCapacity);
         return kExitInvalidArguments;
     }
@@ -420,6 +450,15 @@ int main(int argc, char** argv)
         return 1;
     }
     ConsumerContext& ctx = *ctxHolder;
+
+    // notify 模式：auto-reset 的 dataReady 事件。宣告在 ProcessTrace / 消費者執行緒 handle 之前，
+    // 所以比兩個執行緒活得久（逾時路徑走 ExitProcess，不會先被關閉）
+    ScopedHandle dataReady(wakeNotify ? CreateEventW(nullptr, FALSE, FALSE, nullptr) : nullptr);
+    if (wakeNotify && !dataReady.Valid()) {
+        std::printf("CreateEventW(dataReady) failed, error=%lu\n", GetLastError());
+        return 1;
+    }
+    ctx.dataReadyEvent = dataReady.Get();
     std::printf("Queue: capacity=%zu slots (%s), slot size=%zu bytes, max UserData=%zu bytes, total=%zu bytes\n",
                 ctx.ring.Capacity(), capacityFromCommandLine ? "from --capacity" : "default", sizeof(EventSlot),
                 kMaxUserDataBytes, ctx.ring.Capacity() * sizeof(EventSlot));
@@ -486,6 +525,7 @@ int main(int argc, char** argv)
     consumerArgs.latency = &latency;
     consumerArgs.quiet = quiet;
     consumerArgs.doneEvent = doneEvent.Get();
+    consumerArgs.dataReady = dataReady.Get();
     ScopedHandle consumerThread(CreateThread(nullptr, 0, ConsumerThread, &consumerArgs, 0, nullptr));
     if (!consumerThread.Valid()) {
         std::printf("CreateThread(consumer) failed, error=%lu\n", GetLastError());
@@ -662,6 +702,9 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(c.withExtendedData.load(std::memory_order_relaxed)));
     std::printf("  QPC failures                     = %llu\n",
                 static_cast<unsigned long long>(c.qpcFailures.load(std::memory_order_relaxed)));
+    if (wakeNotify)
+        std::printf("  SetEvent(dataReady) failures     = %llu\n",
+                    static_cast<unsigned long long>(c.dataReadySetEventFailures.load(std::memory_order_relaxed)));
 
     const bool threadsFinished = (etwJoin == WAIT_OBJECT_0 && consumerJoin == WAIT_OBJECT_0);
     bool id1 = false;
@@ -694,8 +737,10 @@ int main(int argc, char** argv)
     AppendLatencyStat(latencyText, "etw_delay", latency.etwDelay, clock.valid ? clock.freq : 0, "  ");
     AppendLatencyStat(latencyText, "queue_wait", latency.queueWait, clock.qpcFrequency, "  ");
     AppendLatencyStat(latencyText, "process", latency.process, clock.qpcFrequency, "  ");
+    AppendLatencyStat(latencyText, "callback", c.callbackDuration, clock.qpcFrequency, "  ");
     std::printf("Latency:\n%s", latencyText.c_str());
     std::printf("quiet=%d\n", quiet ? 1 : 0);
+    std::printf("wake=%s\n", wakeNotify ? "notify" : "poll");
 
     std::printf("Summary: exit code=%d\n", exitCode);
     std::fflush(stdout);
@@ -736,7 +781,9 @@ int main(int argc, char** argv)
         AppendLatencyStat(s, "etw_delay", latency.etwDelay, clock.valid ? clock.freq : 0, "\n");
         AppendLatencyStat(s, "queue_wait", latency.queueWait, clock.qpcFrequency, "\n");
         AppendLatencyStat(s, "process", latency.process, clock.qpcFrequency, "\n");
+        AppendLatencyStat(s, "callback", c.callbackDuration, clock.qpcFrequency, "\n");
         AppendFormat(s, "quiet=%d\n", quiet ? 1 : 0);
+        AppendFormat(s, "wake=%s\n", wakeNotify ? "notify" : "poll");
         AppendFormat(s, "exit_code=%d\n", exitCode);
         WriteSummaryFile(summaryFile, s);
         std::fflush(stdout);
