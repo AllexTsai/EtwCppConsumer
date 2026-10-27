@@ -46,13 +46,42 @@ private:
 
 class EtwSession {
 public:
+    // EVENT_TRACE_PROPERTIES 的緩衝區設定（StartTrace 的輸入）。
+    // 0 = 不指定、由 ETW 決定預設值；flushTimerSec 預設 1 秒（沿用原本的設定）。
+    struct BufferConfig {
+        ULONG bufferSizeKb = 0;
+        ULONG minimumBuffers = 0;
+        ULONG maximumBuffers = 0;
+        ULONG flushTimerSec = 1;
+    };
+
     struct StopResult {
         bool attempted = false;
         ULONG status = ERROR_SUCCESS;
         ULONG eventsLost = 0;
         ULONG realTimeBuffersLost = 0;
+        // ControlTraceW(STOP) 回傳的最終統計（與上面兩個欄位來自同一次呼叫）
+        ULONG numberOfBuffers = 0;
+        ULONG freeBuffers = 0;
+        ULONG buffersWritten = 0;
+        ULONG logBuffersLost = 0;
         SYSTEMTIME before{};
         SYSTEMTIME after{};
+    };
+
+    // ControlTraceW(QUERY) 讀回的實際生效值與當下的統計
+    struct QueryResult {
+        ULONG status = ERROR_INVALID_HANDLE;
+        ULONG bufferSizeKb = 0;
+        ULONG minimumBuffers = 0;
+        ULONG maximumBuffers = 0;
+        ULONG flushTimerSec = 0;
+        ULONG numberOfBuffers = 0;
+        ULONG freeBuffers = 0;
+        ULONG eventsLost = 0;
+        ULONG buffersWritten = 0;
+        ULONG logBuffersLost = 0;
+        ULONG realTimeBuffersLost = 0;
     };
 
     explicit EtwSession(std::wstring name) : name_(std::move(name)) {}
@@ -60,8 +89,14 @@ public:
     EtwSession(const EtwSession&) = delete;
     EtwSession& operator=(const EtwSession&) = delete;
 
+    // 必須在 Start 之前呼叫；沒呼叫時使用 BufferConfig 的預設值（原本的行為）
+    void SetBufferConfig(const BufferConfig& config) { config_ = config; }
+
     // 啟動即時 session。遇到 ERROR_ALREADY_EXISTS（上次殘留）會先停掉再重試一次。
     ULONG Start();
+
+    // ControlTraceW(EVENT_TRACE_CONTROL_QUERY)：讀回系統實際生效的設定。不輸出任何訊息。
+    QueryResult Query() const;
 
     // 不輸出任何訊息；結果與時間戳由呼叫端之後再印。可重複呼叫，第二次以後不做事
     StopResult StopQuiet();
@@ -78,6 +113,7 @@ private:
     std::vector<BYTE> MakeProperties() const;
 
     std::wstring name_;
+    BufferConfig config_;
     TRACEHANDLE handle_ = 0;
 };
 

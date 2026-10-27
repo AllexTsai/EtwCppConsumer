@@ -74,9 +74,36 @@ std::vector<BYTE> EtwSession::MakeProperties() const
     props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
     props->Wnode.ClientContext = 1; // QPC
     props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    props->FlushTimer = 1;          // 秒；讓即時事件盡快送到 consumer
+    // 緩衝區設定：0 = 由 ETW 決定；FlushTimer 預設 1 秒，讓即時事件盡快送到 consumer
+    props->BufferSize = config_.bufferSizeKb;       // KB
+    props->MinimumBuffers = config_.minimumBuffers;
+    props->MaximumBuffers = config_.maximumBuffers;
+    props->FlushTimer = config_.flushTimerSec;      // 秒
     props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     return buffer;
+}
+
+EtwSession::QueryResult EtwSession::Query() const
+{
+    QueryResult r;
+    if (handle_ == 0)
+        return r;
+    std::vector<BYTE> buffer = MakeProperties();
+    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buffer.data());
+    r.status = ControlTraceW(handle_, nullptr, props, EVENT_TRACE_CONTROL_QUERY);
+    if (r.status != ERROR_SUCCESS)
+        return r;
+    r.bufferSizeKb = props->BufferSize;
+    r.minimumBuffers = props->MinimumBuffers;
+    r.maximumBuffers = props->MaximumBuffers;
+    r.flushTimerSec = props->FlushTimer;
+    r.numberOfBuffers = props->NumberOfBuffers;
+    r.freeBuffers = props->FreeBuffers;
+    r.eventsLost = props->EventsLost;
+    r.buffersWritten = props->BuffersWritten;
+    r.logBuffersLost = props->LogBuffersLost;
+    r.realTimeBuffersLost = props->RealTimeBuffersLost;
+    return r;
 }
 
 ULONG EtwSession::Start()
@@ -119,6 +146,10 @@ EtwSession::StopResult EtwSession::StopQuiet()
     GetLocalTime(&r.after);
     r.eventsLost = props->EventsLost;
     r.realTimeBuffersLost = props->RealTimeBuffersLost;
+    r.numberOfBuffers = props->NumberOfBuffers;
+    r.freeBuffers = props->FreeBuffers;
+    r.buffersWritten = props->BuffersWritten;
+    r.logBuffersLost = props->LogBuffersLost;
     handle_ = 0;
     return r;
 }

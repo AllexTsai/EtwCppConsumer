@@ -46,18 +46,72 @@ enum : int {
     kExitInvalidArguments = 11,
 };
 
+// EVENT_TRACE_PROPERTIES.BufferSize 的範圍（KB）。來源：Microsoft Learn「EVENT_TRACE_PROPERTIES」：
+// minimum 4 (4KB)、maximum 16384 (16MB)（Windows 8 以後）
+constexpr unsigned long long kMinBufferKb = 4;
+constexpr unsigned long long kMaxBufferKb = 16384;
+constexpr unsigned long long kMaxUlong = 0xFFFFFFFFULL;
+
+// 讀取 argv[i + 1] 為 [minValue, maxValue] 內的十進位整數；成功時 i 前進一格。失敗時印出原因並回傳 false
+bool ParseUlongOption(const char* option, int argc, char** argv, int& i, unsigned long long minValue,
+                      unsigned long long maxValue, ULONG& out)
+{
+    if (i + 1 >= argc) {
+        std::printf("ERROR: %s requires a value\n", option);
+        return false;
+    }
+    const char* text = argv[++i];
+    // strtoull 會接受前導空白與負號，所以先確認整個字串都是十進位數字
+    if (*text == '\0' || std::strspn(text, "0123456789") != std::strlen(text)) {
+        std::printf("ERROR: %s value '%s' is not a decimal number\n", option, text);
+        return false;
+    }
+    errno = 0;
+    const unsigned long long value = std::strtoull(text, nullptr, 10);
+    if (errno == ERANGE || value < minValue || value > maxValue) {
+        std::printf("ERROR: %s must be between %llu and %llu, got '%s'\n", option, minValue, maxValue, text);
+        return false;
+    }
+    out = static_cast<ULONG>(value);
+    return true;
+}
+
 // 解析命令列。支援：
 //   --capacity N          N 為 2 的冪次，1..kMaxQueueCapacity
 //   --summary-file PATH   結束時另外把總結以 UTF-8 寫進這個檔案
 //   --quiet               不印每筆事件的明細（解析、換算與統計照常）
 //   --wake poll|notify    消費者喚醒方式，預設 poll
+//   --buffer-kb N         EVENT_TRACE_PROPERTIES.BufferSize（KB，4..16384），預設由 ETW 決定
+//   --min-buffers N       MinimumBuffers（>= 1），預設由 ETW 決定
+//   --max-buffers N       MaximumBuffers（>= 1，且不得小於 --min-buffers），預設由 ETW 決定
+//   --flush-timer-sec N   FlushTimer（秒，>= 1），預設 1
 // 格式錯誤時印出原因並回傳 false；不認得的參數只警告並忽略。
 bool ParseArguments(int argc, char** argv, size_t& capacity, bool& fromCommandLine, const char*& summaryFile,
-                    bool& quiet, bool& wakeNotify)
+                    bool& quiet, bool& wakeNotify, EtwSession::BufferConfig& bufferConfig)
 {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quiet") == 0) {
             quiet = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--buffer-kb") == 0) {
+            if (!ParseUlongOption("--buffer-kb", argc, argv, i, kMinBufferKb, kMaxBufferKb, bufferConfig.bufferSizeKb))
+                return false;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--min-buffers") == 0) {
+            if (!ParseUlongOption("--min-buffers", argc, argv, i, 1, kMaxUlong, bufferConfig.minimumBuffers))
+                return false;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--max-buffers") == 0) {
+            if (!ParseUlongOption("--max-buffers", argc, argv, i, 1, kMaxUlong, bufferConfig.maximumBuffers))
+                return false;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--flush-timer-sec") == 0) {
+            if (!ParseUlongOption("--flush-timer-sec", argc, argv, i, 1, kMaxUlong, bufferConfig.flushTimerSec))
+                return false;
             continue;
         }
         if (std::strcmp(argv[i], "--wake") == 0) {
@@ -107,6 +161,13 @@ bool ParseArguments(int argc, char** argv, size_t& capacity, bool& fromCommandLi
         }
         capacity = static_cast<size_t>(value);
         fromCommandLine = true;
+    }
+    // 兩者都有指定時才能比較；只指定一個時由 ETW 依其規則調整另一個
+    if (bufferConfig.minimumBuffers != 0 && bufferConfig.maximumBuffers != 0 &&
+        bufferConfig.minimumBuffers > bufferConfig.maximumBuffers) {
+        std::printf("ERROR: --min-buffers (%lu) must not be greater than --max-buffers (%lu)\n",
+                    bufferConfig.minimumBuffers, bufferConfig.maximumBuffers);
+        return false;
     }
     return true;
 }
@@ -405,9 +466,12 @@ int main(int argc, char** argv)
     const char* summaryFile = nullptr;
     bool quiet = false;
     bool wakeNotify = false;
-    if (!ParseArguments(argc, argv, queueCapacity, capacityFromCommandLine, summaryFile, quiet, wakeNotify)) {
+    EtwSession::BufferConfig bufferConfig; // 預設值 = 原本的行為
+    if (!ParseArguments(argc, argv, queueCapacity, capacityFromCommandLine, summaryFile, quiet, wakeNotify,
+                        bufferConfig)) {
         std::printf("Usage: kernel_process_consumer.exe [--capacity N] [--summary-file PATH] [--quiet]"
-                    " [--wake poll|notify]   (default N=%zu, wake=poll)\n",
+                    " [--wake poll|notify] [--buffer-kb N] [--min-buffers N] [--max-buffers N]"
+                    " [--flush-timer-sec N]   (default N=%zu, wake=poll)\n",
                     kQueueCapacity);
         return kExitInvalidArguments;
     }
@@ -464,6 +528,13 @@ int main(int argc, char** argv)
                 kMaxUserDataBytes, ctx.ring.Capacity() * sizeof(EventSlot));
 
     EtwSession session(kSessionName);
+    session.SetBufferConfig(bufferConfig);
+    {
+        auto valueOrDefault = [](ULONG v) { return v == 0 ? std::string("default") : std::to_string(v); };
+        std::printf("ETW buffers requested: buffer_kb=%s min_buffers=%s max_buffers=%s flush_timer_sec=%lu\n",
+                    valueOrDefault(bufferConfig.bufferSizeKb).c_str(), valueOrDefault(bufferConfig.minimumBuffers).c_str(),
+                    valueOrDefault(bufferConfig.maximumBuffers).c_str(), bufferConfig.flushTimerSec);
+    }
     ULONG status = session.Start();
     if (status != ERROR_SUCCESS) {
         if (status == ERROR_ACCESS_DENIED)
@@ -471,6 +542,18 @@ int main(int argc, char** argv)
         return static_cast<int>(status);
     }
     std::printf("Session started, handle=0x%llx\n", static_cast<unsigned long long>(session.Handle()));
+
+    // 讀回實際生效的值：ETW 可能調整 BufferSize / MinimumBuffers / MaximumBuffers。
+    // 查詢失敗只警告，不影響後續流程
+    const EtwSession::QueryResult effective = session.Query();
+    if (effective.status == ERROR_SUCCESS)
+        std::printf("ETW buffers effective (ControlTraceW QUERY): buffer_kb=%lu min_buffers=%lu max_buffers=%lu "
+                    "flush_timer_sec=%lu number_of_buffers=%lu free_buffers=%lu\n",
+                    effective.bufferSizeKb, effective.minimumBuffers, effective.maximumBuffers, effective.flushTimerSec,
+                    effective.numberOfBuffers, effective.freeBuffers);
+    else
+        std::printf("WARNING: ControlTraceW(QUERY) failed, error=%lu; effective buffer settings unavailable\n",
+                    effective.status);
 
     status = EnableTraceEx2(session.Handle(), &kKernelProcessProvider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                             TRACE_LEVEL_INFORMATION, kKeywordProcess, 0, 0, nullptr);
@@ -705,6 +788,11 @@ int main(int argc, char** argv)
     if (wakeNotify)
         std::printf("  SetEvent(dataReady) failures     = %llu\n",
                     static_cast<unsigned long long>(c.dataReadySetEventFailures.load(std::memory_order_relaxed)));
+    if (stopResult.attempted)
+        std::printf("ETW session at STOP: number_of_buffers=%lu free_buffers=%lu buffers_written=%lu "
+                    "log_buffers_lost=%lu events_lost=%lu realtime_buffers_lost=%lu\n",
+                    stopResult.numberOfBuffers, stopResult.freeBuffers, stopResult.buffersWritten,
+                    stopResult.logBuffersLost, stopResult.eventsLost, stopResult.realTimeBuffersLost);
 
     const bool threadsFinished = (etwJoin == WAIT_OBJECT_0 && consumerJoin == WAIT_OBJECT_0);
     bool id1 = false;
@@ -770,6 +858,24 @@ int main(int argc, char** argv)
             AppendFormat(s, "realtime_buffers_lost=%lu\n", stopResult.realTimeBuffersLost);
         } else {
             AppendFormat(s, "stop_status=NOT_ATTEMPTED\n");
+        }
+        // 啟動後以 ControlTraceW(QUERY) 讀回的實際生效值
+        if (effective.status == ERROR_SUCCESS) {
+            AppendFormat(s, "etw_buffer_kb=%lu\n", effective.bufferSizeKb);
+            AppendFormat(s, "etw_min_buffers=%lu\n", effective.minimumBuffers);
+            AppendFormat(s, "etw_max_buffers=%lu\n", effective.maximumBuffers);
+            AppendFormat(s, "etw_flush_timer_sec=%lu\n", effective.flushTimerSec);
+        } else {
+            AppendFormat(s, "etw_query_status=%lu\n", effective.status);
+            AppendFormat(s, "etw_buffer_kb=UNAVAILABLE\netw_min_buffers=UNAVAILABLE\n"
+                            "etw_max_buffers=UNAVAILABLE\netw_flush_timer_sec=UNAVAILABLE\n");
+        }
+        // ControlTraceW(STOP) 回傳的最終統計（events_lost、realtime_buffers_lost 已在上面）
+        if (stopResult.attempted) {
+            AppendFormat(s, "etw_number_of_buffers=%lu\n", stopResult.numberOfBuffers);
+            AppendFormat(s, "etw_free_buffers=%lu\n", stopResult.freeBuffers);
+            AppendFormat(s, "etw_buffers_written=%lu\n", stopResult.buffersWritten);
+            AppendFormat(s, "etw_log_buffers_lost=%lu\n", stopResult.logBuffersLost);
         }
         if (qpcFrequency.QuadPart > 0)
             AppendFormat(s, "max_callback_us=%.3f\n",
