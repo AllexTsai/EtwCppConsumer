@@ -44,17 +44,22 @@ void WINAPI OnEventRecord(PEVENT_RECORD record)
 
     if (!startOk) {
         ctx->counters.callbackDuration.excluded.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    LARGE_INTEGER end;
-    if (QueryPerformanceCounter(&end)) {
-        const int64_t elapsed = end.QuadPart - start.QuadPart;
-        // 只有 callback 執行緒會寫入，所以 load + store 不會有競爭
-        if (elapsed > ctx->counters.maxCallbackTicks.load(std::memory_order_relaxed))
-            ctx->counters.maxCallbackTicks.store(elapsed, std::memory_order_relaxed);
-        ctx->counters.callbackDuration.Add(elapsed);
     } else {
-        ctx->counters.qpcFailures.fetch_add(1, std::memory_order_relaxed);
-        ctx->counters.callbackDuration.excluded.fetch_add(1, std::memory_order_relaxed);
+        LARGE_INTEGER end;
+        if (QueryPerformanceCounter(&end)) {
+            const int64_t elapsed = end.QuadPart - start.QuadPart;
+            // 只有 callback 執行緒會寫入，所以 load + store 不會有競爭
+            if (elapsed > ctx->counters.maxCallbackTicks.load(std::memory_order_relaxed))
+                ctx->counters.maxCallbackTicks.store(elapsed, std::memory_order_relaxed);
+            ctx->counters.callbackDuration.Add(elapsed);
+        } else {
+            ctx->counters.qpcFailures.fetch_add(1, std::memory_order_relaxed);
+            ctx->counters.callbackDuration.excluded.fetch_add(1, std::memory_order_relaxed);
+        }
     }
+
+    // TEST ONLY: 人為延遲 callback，用來驗證遺失計數，不代表效能。
+    // 放在計時之後，所以 callback 耗時統計不含這段 Sleep。值為 0 時不呼叫。
+    if (ctx->testCallbackDelayMs > 0)
+        Sleep(ctx->testCallbackDelayMs);
 }

@@ -50,6 +50,9 @@ struct ConsumerContext {
     // notify 模式：auto-reset 事件，callback 每次 TryPush 成功後 SetEvent；
     // nullptr = poll 模式（不通知）。由呼叫端擁有（RAII），必須比 ProcessTrace 執行緒活得久。
     HANDLE dataReadyEvent = nullptr;
+    // TEST ONLY: 人為延遲 callback，用來驗證遺失計數，不代表效能。
+    // 大於 0 時 OnEventRecord 在處理完成後 Sleep 這麼多毫秒；0 = 正常行為（預設）。
+    DWORD testCallbackDelayMs = 0;
 };
 
 // callback 本體（不計時）：只檢查 provider、複製進槽位、更新原子計數器；

@@ -51,6 +51,8 @@ enum : int {
 constexpr unsigned long long kMinBufferKb = 4;
 constexpr unsigned long long kMaxBufferKb = 16384;
 constexpr unsigned long long kMaxUlong = 0xFFFFFFFFULL;
+// TEST ONLY: 人為延遲 callback 的上限（毫秒），用來驗證遺失計數，不代表效能
+constexpr unsigned long long kMaxTestCallbackDelayMs = 1000;
 
 // 讀取 argv[i + 1] 為 [minValue, maxValue] 內的十進位整數；成功時 i 前進一格。失敗時印出原因並回傳 false
 bool ParseUlongOption(const char* option, int argc, char** argv, int& i, unsigned long long minValue,
@@ -85,9 +87,11 @@ bool ParseUlongOption(const char* option, int argc, char** argv, int& i, unsigne
 //   --min-buffers N       MinimumBuffers（>= 1），預設由 ETW 決定
 //   --max-buffers N       MaximumBuffers（>= 1，且不得小於 --min-buffers），預設由 ETW 決定
 //   --flush-timer-sec N   FlushTimer（秒，>= 1），預設 1
+//   --test-callback-delay-ms N
+//                         TEST ONLY: 人為延遲 callback，用來驗證遺失計數，不代表效能（0..1000，預設 0）
 // 格式錯誤時印出原因並回傳 false；不認得的參數只警告並忽略。
 bool ParseArguments(int argc, char** argv, size_t& capacity, bool& fromCommandLine, const char*& summaryFile,
-                    bool& quiet, bool& wakeNotify, EtwSession::BufferConfig& bufferConfig)
+                    bool& quiet, bool& wakeNotify, EtwSession::BufferConfig& bufferConfig, ULONG& testCallbackDelayMs)
 {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quiet") == 0) {
@@ -111,6 +115,12 @@ bool ParseArguments(int argc, char** argv, size_t& capacity, bool& fromCommandLi
         }
         if (std::strcmp(argv[i], "--flush-timer-sec") == 0) {
             if (!ParseUlongOption("--flush-timer-sec", argc, argv, i, 1, kMaxUlong, bufferConfig.flushTimerSec))
+                return false;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--test-callback-delay-ms") == 0) {
+            if (!ParseUlongOption("--test-callback-delay-ms", argc, argv, i, 0, kMaxTestCallbackDelayMs,
+                                  testCallbackDelayMs))
                 return false;
             continue;
         }
@@ -467,13 +477,21 @@ int main(int argc, char** argv)
     bool quiet = false;
     bool wakeNotify = false;
     EtwSession::BufferConfig bufferConfig; // 預設值 = 原本的行為
+    ULONG testCallbackDelayMs = 0;         // TEST ONLY，0 = 正常行為
     if (!ParseArguments(argc, argv, queueCapacity, capacityFromCommandLine, summaryFile, quiet, wakeNotify,
-                        bufferConfig)) {
+                        bufferConfig, testCallbackDelayMs)) {
         std::printf("Usage: kernel_process_consumer.exe [--capacity N] [--summary-file PATH] [--quiet]"
                     " [--wake poll|notify] [--buffer-kb N] [--min-buffers N] [--max-buffers N]"
-                    " [--flush-timer-sec N]   (default N=%zu, wake=poll)\n",
-                    kQueueCapacity);
+                    " [--flush-timer-sec N] [--test-callback-delay-ms N]   (default N=%zu, wake=poll)\n"
+                    "  --test-callback-delay-ms N  TEST ONLY: 人為延遲 callback，用來驗證遺失計數，不代表效能"
+                    " (0..%llu, default 0)\n",
+                    kQueueCapacity, kMaxTestCallbackDelayMs);
         return kExitInvalidArguments;
+    }
+    if (testCallbackDelayMs > 0) {
+        std::printf("TEST MODE: artificial callback delay, numbers are not performance data"
+                    " (--test-callback-delay-ms %lu)\n", testCallbackDelayMs);
+        std::fflush(stdout);
     }
 
     // 第一個建立、最後一個解構：所有 return 路徑都會還原 console 模式
@@ -523,6 +541,7 @@ int main(int argc, char** argv)
         return 1;
     }
     ctx.dataReadyEvent = dataReady.Get();
+    ctx.testCallbackDelayMs = testCallbackDelayMs; // TEST ONLY；在 ProcessTrace 啟動前設定，之後唯讀
     std::printf("Queue: capacity=%zu slots (%s), slot size=%zu bytes, max UserData=%zu bytes, total=%zu bytes\n",
                 ctx.ring.Capacity(), capacityFromCommandLine ? "from --capacity" : "default", sizeof(EventSlot),
                 kMaxUserDataBytes, ctx.ring.Capacity() * sizeof(EventSlot));
@@ -829,6 +848,7 @@ int main(int argc, char** argv)
     std::printf("Latency:\n%s", latencyText.c_str());
     std::printf("quiet=%d\n", quiet ? 1 : 0);
     std::printf("wake=%s\n", wakeNotify ? "notify" : "poll");
+    std::printf("test_callback_delay_ms=%lu\n", testCallbackDelayMs);
 
     std::printf("Summary: exit code=%d\n", exitCode);
     std::fflush(stdout);
@@ -890,6 +910,7 @@ int main(int argc, char** argv)
         AppendLatencyStat(s, "callback", c.callbackDuration, clock.qpcFrequency, "\n");
         AppendFormat(s, "quiet=%d\n", quiet ? 1 : 0);
         AppendFormat(s, "wake=%s\n", wakeNotify ? "notify" : "poll");
+        AppendFormat(s, "test_callback_delay_ms=%lu\n", testCallbackDelayMs);
         AppendFormat(s, "exit_code=%d\n", exitCode);
         WriteSummaryFile(summaryFile, s);
         std::fflush(stdout);
