@@ -12,6 +12,7 @@ run*.txt
 summary_*.txt
 started_pids*.txt
 *.log
+integration_out/
 
 # 編輯器
 .vs/

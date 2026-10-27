@@ -40,3 +40,6 @@ add_executable(test_parse_copy tests/test_parse_copy.cpp)
 target_link_libraries(test_parse_copy PRIVATE etw_consumer_core)
 add_test(NAME parse_copy COMMAND test_parse_copy)
 set_tests_properties(parse_copy PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# 整合測試輔助工具（sendctrlc、getmode），不加入 ctest
+add_subdirectory(tests/integration)
